@@ -1,5 +1,5 @@
 """
-tool__tauto_nostage.py  v22
+tool__tauto_nostage.py  v23
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Luồng hoạt động:
   1. Forward bài vào Saved Messages
@@ -24,6 +24,12 @@ Fixes v22 (so với v21):
   [DEDUP]    update_menu debounce (_menu_gen): chỉ 1 menu task chạy khi batch ngừng
   [DEDUP]    ensure_topic_detected: chờ _detect, fallback 1 lần qua lock — không spam API
   [SPEED]    _start_forward: load_ads nền, báo "chạy nền" ngay không chờ
+
+Fixes v23 (so với v22):
+  [MAP-FIX]  topic cache key (src_id, top_id) — tránh map nhầm kênh cùng topic id
+  [MAP-FIX]  không cache title giả khi API fail lúc flood — chờ retry thay vì map sai
+  [MAP-FIX]  update_menu bind đúng slot — không lấy nhầm slot mới khi đang chờ
+  [MAP-FIX]  verify_slot_topic trước khi auto-map — xác nhận lại từ bài đầu batch
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
@@ -160,6 +166,7 @@ def make_slot():
         "channel_commands":  {},
         "topic_id":          None,
         "topic_title":       None,
+        "topic_src_id":      None,
         "topic_checked":     False,
         "all_mode":          False,
         "_album_pending":         0,
@@ -198,6 +205,7 @@ def reset_slot(slot):
     slot["channel_commands"] = {}
     slot["topic_id"]         = None
     slot["topic_title"]      = None
+    slot["topic_src_id"]     = None
     slot["topic_checked"]    = False
     slot["all_mode"]         = False
     slot["_album_pending"]        = 0
@@ -341,6 +349,25 @@ def find_channels(query: str):
 
 _topic_title_cache = {}
 
+
+def _is_valid_topic_title(title) -> bool:
+    if not title:
+        return False
+    t = str(title).strip()
+    if not t or t == "General":
+        return False
+    if t.startswith("topic "):
+        return False
+    return True
+
+
+def _set_slot_topic(slot, src_id, top_id, title, source=""):
+    slot["topic_src_id"]  = src_id
+    slot["topic_id"]      = top_id
+    slot["topic_title"]   = title
+    log("TOPIC", f"{source} topic='{title}' id={top_id} src={src_id}")
+
+
 async def resolve_forward_topic(client, saved_msg_id):
     from pyrogram.raw import functions as fn, types as tt
     from pyrogram import utils as ut
@@ -372,14 +399,25 @@ async def resolve_forward_topic(client, saved_msg_id):
                 top_id = (getattr(rt, "reply_to_top_id", None) or getattr(rt, "reply_to_msg_id", None))
             else:
                 top_id = 1
-            title = _topic_title_cache.get(top_id)
+
+            cache_key = (src_id, top_id)
+            title = _topic_title_cache.get(cache_key)
             if title is None:
                 try:
                     ft    = await client.invoke(fn.channels.GetForumTopicsByID(channel=inch, topics=[top_id]))
-                    title = (ft.topics[0].title if getattr(ft, "topics", None) else f"topic {top_id}")
-                except Exception:
-                    title = "General" if top_id == 1 else f"topic {top_id}"
-                _topic_title_cache[top_id] = title
+                    title = (ft.topics[0].title if getattr(ft, "topics", None) else None)
+                except FloodWait:
+                    raise
+                except Exception as exc:
+                    log("WARN", f"GetForumTopicsByID fail src={src_id} topic={top_id}: {exc}")
+                    title = None
+                if _is_valid_topic_title(title):
+                    _topic_title_cache[cache_key] = title
+                else:
+                    title = None
+
+            if not _is_valid_topic_title(title):
+                return (src_id, top_id, None)
             return (src_id, top_id, title)
 
         except FloodWait as e:
@@ -400,7 +438,7 @@ async def resolve_forward_topic(client, saved_msg_id):
 
 async def ensure_topic_detected(slot, client=None, max_wait=TOPIC_DETECT_MAX_WAIT_SEC):
     """Chờ _detect duy nhất của batch. Không gọi API song song."""
-    if slot.get("topic_title"):
+    if _is_valid_topic_title(slot.get("topic_title")) and slot.get("topic_src_id"):
         return True
     client = client or app
 
@@ -411,27 +449,38 @@ async def ensure_topic_detected(slot, client=None, max_wait=TOPIC_DETECT_MAX_WAI
         except asyncio.TimeoutError:
             log("TOPIC", f"ensure_topic_detected: chờ _detect timeout {max_wait}s")
 
-    if slot.get("topic_title"):
+    if _is_valid_topic_title(slot.get("topic_title")) and slot.get("topic_src_id"):
         return True
 
-    # Fallback 1 lần khi _detect xong mà vẫn không có topic (hiếm)
+    return await verify_slot_topic(slot, client, source="ensure_topic_detected")
+
+
+async def verify_slot_topic(slot, client=None, source="verify"):
+    """Xác nhận topic từ bài đầu batch — tránh map nhầm do cache/flood."""
     if not slot.get("content_msgs"):
         return False
-
+    client = client or app
     msg_id = slot["content_msgs"][0]
+
     async with _topic_resolve_lock:
-        if slot.get("topic_title"):
-            return True
         src_id, top_id, top_title = await resolve_forward_topic(client, msg_id)
-        if top_id is not None and top_title:
-            slot["topic_id"]    = top_id
-            slot["topic_title"] = top_title
-            log("TOPIC", f"ensure_topic_detected fallback OK topic='{top_title}' id={top_id}")
-            if ev is not None and not ev.is_set():
-                ev.set()
+        if not _is_valid_topic_title(top_title) or top_id is None:
+            log("TOPIC", f"{source}: chưa có topic hợp lệ cho msg={msg_id}")
+            return False
+
+        cur_title = slot.get("topic_title")
+        cur_src   = slot.get("topic_src_id")
+        if cur_title == top_title and cur_src == src_id:
             return True
 
-    return bool(slot.get("topic_title"))
+        if cur_title and cur_title != top_title:
+            log("TOPIC", f"{source}: sửa topic {cur_title!r} → {top_title!r} (src={src_id})")
+
+        _set_slot_topic(slot, src_id, top_id, top_title, source=source)
+        ev = slot.get("_topic_event")
+        if ev is not None and not ev.is_set():
+            ev.set()
+        return True
 
 
 TOPIC_MAP_TXT = "topic_map.txt"
@@ -765,15 +814,14 @@ def schedule_update_menu(n):
     slot = active_slot()
     slot["_menu_gen"] = slot.get("_menu_gen", 0) + 1
     gen = slot["_menu_gen"]
-    asyncio.ensure_future(update_menu(n, gen))
+    asyncio.ensure_future(update_menu(slot, n, gen))
 
 
-async def update_menu(n, gen=None):
+async def update_menu(slot, n, gen=None):
     await asyncio.sleep(2)
-    slot = active_slot()
     if gen is not None and gen != slot.get("_menu_gen"):
         return
-    if not slot["waiting"]:
+    if not slot.get("waiting"):
         return
 
     for _ in range(30):
@@ -792,10 +840,22 @@ async def update_menu(n, gen=None):
         await do_all_forward(slot)
         return
 
-    # [FLOOD-TOPIC] chờ + retry topic detect trước khi quyết định auto map
-    await ensure_topic_detected(slot, app)
+    # Xác nhận topic từ bài đầu batch trước khi auto-map
+    topic_ok = await ensure_topic_detected(slot, app)
+    if not topic_ok:
+        log("TOPIC", "Chưa xác nhận được topic — chờ thêm hoặc chọn tay /done")
+        text = get_menu(n)
+        if slot.get("menu_msg_id"):
+            ok = await robust_edit(INTERMEDIATE_CHAT, slot["menu_msg_id"], text)
+            if ok:
+                return
+            slot["menu_msg_id"] = None
+        m = await robust_send(text)
+        if m is not None:
+            slot["menu_msg_id"] = m.id
+        return
 
-    if len(slot["content_msgs"]) != n or not slot["waiting"]:
+    if len(slot["content_msgs"]) != n or not slot.get("waiting"):
         return
 
     mode         = get_xepbai_mode()
@@ -803,8 +863,8 @@ async def update_menu(n, gen=None):
     whitelist    = get_xepbai_whitelist()
     force_manual = any(c.lower() in whitelist for c in mapped_cmds)
     topic_auto   = bool(mapped_cmds) and not force_manual
-    log("XEPBAI", f"mode={mode} topic={slot.get('topic_title')!r} mapped={mapped_cmds} "
-                  f"force_manual={force_manual} topic_auto={topic_auto}")
+    log("XEPBAI", f"mode={mode} topic={slot.get('topic_title')!r} src={slot.get('topic_src_id')} "
+                  f"mapped={mapped_cmds} force_manual={force_manual} topic_auto={topic_auto}")
 
     if (mode == "off" and not force_manual) or topic_auto:
         if not slot["ads_msgs"]:
@@ -816,7 +876,7 @@ async def update_menu(n, gen=None):
         media_cnt = slot.get("total_media_count", 0)
         media_hint = f"{n} bài / {media_cnt} media" if media_cnt else f"{n} bài"
         asyncio.ensure_future(safe_send(f"⏳ {media_hint} — đang xếp & forward..."))
-        await build_sequence(best, skip_topic_wait=bool(slot.get("topic_title")))
+        await build_sequence(best)
         return
 
     text = get_menu(n)
@@ -1060,7 +1120,7 @@ async def forward_sequence_to_channel(target_id, sequence):
     return sent_count, failed_items, dead_reason
 
 
-async def build_sequence(content_per_ads=1, mode="normal", skip_topic_wait=False):
+async def build_sequence(content_per_ads=1, mode="normal"):
     slot         = active_slot()
     contents     = slot["content_msgs"]
     n            = len(contents)
@@ -1152,8 +1212,16 @@ async def build_sequence(content_per_ads=1, mode="normal", skip_topic_wait=False
     slot["awaiting_channel"] = True
     slot["waiting"]          = False
 
-    if not skip_topic_wait and not slot.get("topic_title"):
-        await ensure_topic_detected(slot, app)
+    if not await verify_slot_topic(slot, app, source="build_sequence"):
+        await safe_send(
+            f"⚠️ Chưa xác nhận được topic (có thể đang flood) — batch {media_str}.\n"
+            f"Chờ vài giây rồi gõ /done hoặc chọn kênh tay."
+        )
+        slot["awaiting_channel"] = True
+        channels            = load_channels()
+        chan_lines, cmd_map = build_channel_commands(channels)
+        slot["channel_commands"] = cmd_map
+        return
 
     mapped_cmds = find_cmds_for_topic_title(slot.get("topic_title"))
 
@@ -1671,10 +1739,8 @@ async def handler(client, msg: Message):
                                         break
                                     await asyncio.sleep(remain)
                                 src_id, top_id, top_title = await resolve_forward_topic(client, saved_msg_id)
-                                if top_id is not None and top_title:
-                                    target_slot["topic_id"]    = top_id
-                                    target_slot["topic_title"] = top_title
-                                    log("TOPIC", f"Batch topic='{top_title}' id={top_id}")
+                                if top_id is not None and _is_valid_topic_title(top_title):
+                                    _set_slot_topic(target_slot, src_id, top_id, top_title, source="Batch")
                                     break
                                 if attempt < FWD_MAX_RETRY - 1:
                                     await asyncio.sleep(2 * (attempt + 1))
@@ -2000,7 +2066,7 @@ async def handler(client, msg: Message):
 
     if text == "/help":
         await safe_send(
-            "📖 Hướng dẫn v22\n"
+            "📖 Hướng dẫn v23\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
             "🚀 Flow:\n"
             "  1. Forward bài vào Saved Messages\n"
@@ -2082,7 +2148,7 @@ async def main():
     n_folders  = len(load_folders())
     n_channels = len(load_channels())
     await safe_send(
-        "🤖 Userbot v22 đã khởi động!\n"
+        "🤖 Userbot v23 đã khởi động!\n"
         f"📡 {n_channels} kênh • 📁 {n_folders} folder auto-sync\n"
         "➡️ Forward bài vào Saved Messages → /done* → nhập tên kênh.\n"
         "Gõ /help để xem hướng dẫn."
