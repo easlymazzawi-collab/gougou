@@ -1,5 +1,5 @@
 """
-tool__tauto_nostage.py  v21
+tool__tauto_nostage.py  v22
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Luồng hoạt động:
   1. Forward bài vào Saved Messages
@@ -18,6 +18,12 @@ Fixes v21 (so với v20):
   [FLOOD-TOPIC] ensure_topic_detected: chờ + retry detect trước khi xếp/auto-forward
   [FLOOD-TOPIC] update_menu: gọi ensure_topic_detected thay vì timeout 15s rồi bỏ topic
   [FLOOD-TOPIC] _detect: topic_checked chỉ set khi xong; retry khi flood
+
+Fixes v22 (so với v21):
+  [DEDUP]    _topic_detect_started: chỉ 1 task _detect / batch (tránh 30+ API calls)
+  [DEDUP]    update_menu debounce (_menu_gen): chỉ 1 menu task chạy khi batch ngừng
+  [DEDUP]    ensure_topic_detected: chờ _detect, fallback 1 lần qua lock — không spam API
+  [SPEED]    _start_forward: load_ads nền, báo "chạy nền" ngay không chờ
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
@@ -118,6 +124,7 @@ _channels_write_lock = asyncio.Lock()
 
 _flood_gate  = asyncio.Lock()
 _flood_until = 0.0
+_topic_resolve_lock = asyncio.Lock()
 
 
 def log(tag, msg):
@@ -155,8 +162,10 @@ def make_slot():
         "topic_title":       None,
         "topic_checked":     False,
         "all_mode":          False,
-        "_album_pending":    0,
-        "total_media_count": 0,
+        "_album_pending":         0,
+        "total_media_count":      0,
+        "_topic_detect_started":  False,
+        "_menu_gen":              0,
     }
 
 state = {
@@ -191,8 +200,10 @@ def reset_slot(slot):
     slot["topic_title"]      = None
     slot["topic_checked"]    = False
     slot["all_mode"]         = False
-    slot["_album_pending"]    = 0
-    slot["total_media_count"] = 0
+    slot["_album_pending"]        = 0
+    slot["total_media_count"]     = 0
+    slot["_topic_detect_started"] = False
+    slot["_menu_gen"]             = 0
     slot.pop("_topic_event", None)
 
 def reset_state():
@@ -388,55 +399,41 @@ async def resolve_forward_topic(client, saved_msg_id):
 
 
 async def ensure_topic_detected(slot, client=None, max_wait=TOPIC_DETECT_MAX_WAIT_SEC):
-  """Chờ + retry topic detect — tránh flood vài giây làm mất mapping."""
-  if slot.get("topic_title"):
-      return True
-  client = client or app
+    """Chờ _detect duy nhất của batch. Không gọi API song song."""
+    if slot.get("topic_title"):
+        return True
+    client = client or app
 
-  ev = slot.get("_topic_event")
-  if ev is not None and not ev.is_set():
-      try:
-          await asyncio.wait_for(ev.wait(), timeout=max_wait)
-      except asyncio.TimeoutError:
-          log("TOPIC", f"ensure_topic_detected: chờ _detect timeout {max_wait}s — thử retry")
+    ev = slot.get("_topic_event")
+    if ev is not None and not ev.is_set():
+        try:
+            await asyncio.wait_for(ev.wait(), timeout=max_wait)
+        except asyncio.TimeoutError:
+            log("TOPIC", f"ensure_topic_detected: chờ _detect timeout {max_wait}s")
 
-  if slot.get("topic_title"):
-      return True
+    if slot.get("topic_title"):
+        return True
 
-  if not slot.get("content_msgs"):
-      return False
+    # Fallback 1 lần khi _detect xong mà vẫn không có topic (hiếm)
+    if not slot.get("content_msgs"):
+        return False
 
-  msg_id = slot["content_msgs"][0]
-  for attempt in range(FWD_MAX_RETRY):
-      try:
-          while True:
-              remain = _flood_until - time.monotonic()
-              if remain <= 0:
-                  break
-              await asyncio.sleep(remain)
-          src_id, top_id, top_title = await resolve_forward_topic(client, msg_id)
-          if top_id is not None and top_title:
-              slot["topic_id"]    = top_id
-              slot["topic_title"] = top_title
-              log("TOPIC", f"ensure_topic_detected OK topic='{top_title}' id={top_id}")
-              if ev is not None and not ev.is_set():
-                  ev.set()
-              return True
-          if top_id is None:
-              break
-      except FloodWait as e:
-          wait = e.value + 2
-          log("FLOOD", f"ensure_topic_detected FloodWait {wait}s — retry {attempt+1}/{FWD_MAX_RETRY}")
-          await flood_wait_globally(wait, source="ensure_topic")
-          continue
-      except Exception as e:
-          if attempt < FWD_MAX_RETRY - 1:
-              await asyncio.sleep(2 * (attempt + 1))
-              continue
-          log("WARN", f"ensure_topic_detected: {type(e).__name__}: {e}")
-          break
+    msg_id = slot["content_msgs"][0]
+    async with _topic_resolve_lock:
+        if slot.get("topic_title"):
+            return True
+        src_id, top_id, top_title = await resolve_forward_topic(client, msg_id)
+        if top_id is not None and top_title:
+            slot["topic_id"]    = top_id
+            slot["topic_title"] = top_title
+            log("TOPIC", f"ensure_topic_detected fallback OK topic='{top_title}' id={top_id}")
+            if ev is not None and not ev.is_set():
+                ev.set()
+            return True
 
-  return bool(slot.get("topic_title"))
+    return bool(slot.get("topic_title"))
+
+
 TOPIC_MAP_TXT = "topic_map.txt"
 
 TOPIC_MAP_TEMPLATE = (
@@ -762,9 +759,20 @@ def get_menu(n_content):
     ]
     return "\n".join(lines)
 
-async def update_menu(n):
+
+def schedule_update_menu(n):
+    """Debounce: mỗi bài mới tăng gen — chỉ task gen mới nhất được chạy."""
+    slot = active_slot()
+    slot["_menu_gen"] = slot.get("_menu_gen", 0) + 1
+    gen = slot["_menu_gen"]
+    asyncio.ensure_future(update_menu(n, gen))
+
+
+async def update_menu(n, gen=None):
     await asyncio.sleep(2)
     slot = active_slot()
+    if gen is not None and gen != slot.get("_menu_gen"):
+        return
     if not slot["waiting"]:
         return
 
@@ -774,6 +782,9 @@ async def update_menu(n):
         await asyncio.sleep(0.5)
 
     if len(slot["content_msgs"]) != n or not slot["waiting"]:
+        return
+
+    if gen is not None and gen != slot.get("_menu_gen"):
         return
 
     if slot.get("all_mode"):
@@ -802,7 +813,10 @@ async def update_menu(n):
         best      = max(1, round(n / ads_count))
         reason    = f"topic map ({slot.get('topic_title')!r})" if topic_auto else "xepbai=off"
         log("XEPBAI", f"{reason} → tự xếp /done{best}")
-        await build_sequence(best)
+        media_cnt = slot.get("total_media_count", 0)
+        media_hint = f"{n} bài / {media_cnt} media" if media_cnt else f"{n} bài"
+        asyncio.ensure_future(safe_send(f"⏳ {media_hint} — đang xếp & forward..."))
+        await build_sequence(best, skip_topic_wait=bool(slot.get("topic_title")))
         return
 
     text = get_menu(n)
@@ -1046,7 +1060,7 @@ async def forward_sequence_to_channel(target_id, sequence):
     return sent_count, failed_items, dead_reason
 
 
-async def build_sequence(content_per_ads=1, mode="normal"):
+async def build_sequence(content_per_ads=1, mode="normal", skip_topic_wait=False):
     slot         = active_slot()
     contents     = slot["content_msgs"]
     n            = len(contents)
@@ -1138,8 +1152,8 @@ async def build_sequence(content_per_ads=1, mode="normal"):
     slot["awaiting_channel"] = True
     slot["waiting"]          = False
 
-    # [FLOOD-TOPIC] đảm bảo topic trước khi auto-map kênh
-    await ensure_topic_detected(slot, app)
+    if not skip_topic_wait and not slot.get("topic_title"):
+        await ensure_topic_detected(slot, app)
 
     mapped_cmds = find_cmds_for_topic_title(slot.get("topic_title"))
 
@@ -1337,7 +1351,7 @@ async def _start_forward(slot, results, query_display: str = ""):
     )
     new_s = make_slot()
     state["slots"].append(new_s)
-    await load_ads_into(new_s)
+    asyncio.ensure_future(load_ads_into(new_s))
     asyncio.ensure_future(do_forward_job(slot, results))
 
 async def cmd_select_channel(query: str):
@@ -1641,41 +1655,43 @@ async def handler(client, msg: Message):
             await load_ads_into(slot)
             return
 
-        is_first = not slot.get("topic_checked") and not slot.get("all_mode")
+        is_first = not slot.get("_topic_detect_started") and not slot.get("all_mode")
         if is_first:
+            slot["_topic_detect_started"] = True
             slot["_topic_event"] = asyncio.Event()
 
             async def _detect(saved_msg_id, ev, target_slot):
                 try:
-                    for attempt in range(FWD_MAX_RETRY):
-                        try:
-                            while True:
-                                remain = _flood_until - time.monotonic()
-                                if remain <= 0:
+                    async with _topic_resolve_lock:
+                        for attempt in range(FWD_MAX_RETRY):
+                            try:
+                                while True:
+                                    remain = _flood_until - time.monotonic()
+                                    if remain <= 0:
+                                        break
+                                    await asyncio.sleep(remain)
+                                src_id, top_id, top_title = await resolve_forward_topic(client, saved_msg_id)
+                                if top_id is not None and top_title:
+                                    target_slot["topic_id"]    = top_id
+                                    target_slot["topic_title"] = top_title
+                                    log("TOPIC", f"Batch topic='{top_title}' id={top_id}")
                                     break
-                                await asyncio.sleep(remain)
-                            src_id, top_id, top_title = await resolve_forward_topic(client, saved_msg_id)
-                            if top_id is not None:
-                                target_slot["topic_id"]    = top_id
-                                target_slot["topic_title"] = top_title
-                                log("TOPIC", f"Batch topic='{top_title}' id={top_id}")
-                                break
-                            if attempt < FWD_MAX_RETRY - 1:
-                                await asyncio.sleep(2 * (attempt + 1))
-                        except FloodWait as e:
-                            wait = e.value + 2
-                            log("FLOOD", f"_detect FloodWait {wait}s — retry {attempt+1}/{FWD_MAX_RETRY}")
-                            await flood_wait_globally(wait, source="detect")
-                            continue
-                        except Exception as e:
-                            if attempt < FWD_MAX_RETRY - 1:
-                                log("WARN", f"_detect attempt {attempt+1}: {type(e).__name__}: {e}")
-                                await asyncio.sleep(2 * (attempt + 1))
+                                if attempt < FWD_MAX_RETRY - 1:
+                                    await asyncio.sleep(2 * (attempt + 1))
+                            except FloodWait as e:
+                                wait = e.value + 2
+                                log("FLOOD", f"_detect FloodWait {wait}s — retry {attempt+1}/{FWD_MAX_RETRY}")
+                                await flood_wait_globally(wait, source="detect")
                                 continue
-                            log("TOPIC", f"Không detect được topic: {e}")
-                            break
-                    else:
-                        log("TOPIC", "Không detect được topic sau hết retry")
+                            except Exception as e:
+                                if attempt < FWD_MAX_RETRY - 1:
+                                    log("WARN", f"_detect attempt {attempt+1}: {type(e).__name__}: {e}")
+                                    await asyncio.sleep(2 * (attempt + 1))
+                                    continue
+                                log("TOPIC", f"Không detect được topic: {e}")
+                                break
+                        else:
+                            log("TOPIC", "Không detect được topic sau hết retry")
                 finally:
                     target_slot["topic_checked"] = True
                     ev.set()
@@ -1730,7 +1746,7 @@ async def handler(client, msg: Message):
                        f"{' (media)' if has_media else ' (text)'}"
                        f" | total_media={slot.get('total_media_count', 0)}")
 
-        asyncio.ensure_future(update_menu(len(slot["content_msgs"])))
+        schedule_update_menu(len(slot["content_msgs"]))
         return
 
     if msg.chat.id != INTERMEDIATE_CHAT:
@@ -1984,7 +2000,7 @@ async def handler(client, msg: Message):
 
     if text == "/help":
         await safe_send(
-            "📖 Hướng dẫn v21\n"
+            "📖 Hướng dẫn v22\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
             "🚀 Flow:\n"
             "  1. Forward bài vào Saved Messages\n"
@@ -2066,7 +2082,7 @@ async def main():
     n_folders  = len(load_folders())
     n_channels = len(load_channels())
     await safe_send(
-        "🤖 Userbot v21 đã khởi động!\n"
+        "🤖 Userbot v22 đã khởi động!\n"
         f"📡 {n_channels} kênh • 📁 {n_folders} folder auto-sync\n"
         "➡️ Forward bài vào Saved Messages → /done* → nhập tên kênh.\n"
         "Gõ /help để xem hướng dẫn."
