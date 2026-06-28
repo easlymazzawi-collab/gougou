@@ -1,5 +1,5 @@
 """
-tool__tauto_nostage.py  v23
+tool__tauto_nostage.py  v24
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Luồng hoạt động:
   1. Forward bài vào Saved Messages
@@ -30,6 +30,11 @@ Fixes v23 (so với v22):
   [MAP-FIX]  không cache title giả khi API fail lúc flood — chờ retry thay vì map sai
   [MAP-FIX]  update_menu bind đúng slot — không lấy nhầm slot mới khi đang chờ
   [MAP-FIX]  verify_slot_topic trước khi auto-map — xác nhận lại từ bài đầu batch
+
+Fixes v24 (so với v23):
+  [FAST]     nhận xong batch → báo "chạy nền" ngay, xếp/forward chạy background
+  [FAST]     topic chỉ check 1 lần từ bài đầu (_detect) — bỏ verify trùng lặp
+  [FAST]     update_menu không block chờ topic/flood — user không phải đợi
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
@@ -82,7 +87,8 @@ FWD_BATCH_MIN_DELAY = 1.0
 FWD_GLOBAL_RATE     = 10.0
 FWD_GLOBAL_BURST    = 15
 
-TOPIC_DETECT_MAX_WAIT_SEC = 45
+TOPIC_DETECT_MAX_WAIT_SEC = 30
+MENU_DEBOUNCE_SEC         = 1.5
 
 DEAD_CHANNEL_ERRORS = (
     ChannelInvalid,
@@ -173,6 +179,7 @@ def make_slot():
         "total_media_count":      0,
         "_topic_detect_started":  False,
         "_menu_gen":              0,
+        "_batch_processing":      False,
     }
 
 state = {
@@ -212,6 +219,7 @@ def reset_slot(slot):
     slot["total_media_count"]     = 0
     slot["_topic_detect_started"] = False
     slot["_menu_gen"]             = 0
+    slot["_batch_processing"]     = False
     slot.pop("_topic_event", None)
 
 def reset_state():
@@ -436,51 +444,33 @@ async def resolve_forward_topic(client, saved_msg_id):
     return (None, None, None)
 
 
-async def ensure_topic_detected(slot, client=None, max_wait=TOPIC_DETECT_MAX_WAIT_SEC):
-    """Chờ _detect duy nhất của batch. Không gọi API song song."""
+async def wait_for_topic(slot, max_wait=TOPIC_DETECT_MAX_WAIT_SEC):
+    """Chờ _detect (1 API bài đầu) xong. Không gọi thêm API nếu đã có topic."""
     if _is_valid_topic_title(slot.get("topic_title")) and slot.get("topic_src_id"):
         return True
-    client = client or app
-
     ev = slot.get("_topic_event")
     if ev is not None and not ev.is_set():
         try:
             await asyncio.wait_for(ev.wait(), timeout=max_wait)
         except asyncio.TimeoutError:
-            log("TOPIC", f"ensure_topic_detected: chờ _detect timeout {max_wait}s")
-
-    if _is_valid_topic_title(slot.get("topic_title")) and slot.get("topic_src_id"):
-        return True
-
-    return await verify_slot_topic(slot, client, source="ensure_topic_detected")
+            log("TOPIC", f"wait_for_topic: timeout {max_wait}s")
+    return _is_valid_topic_title(slot.get("topic_title")) and bool(slot.get("topic_src_id"))
 
 
-async def verify_slot_topic(slot, client=None, source="verify"):
-    """Xác nhận topic từ bài đầu batch — tránh map nhầm do cache/flood."""
+async def _topic_fallback_once(slot, client=None):
+    """1 lần retry duy nhất khi _detect fail (flood). Dùng bài đầu batch."""
     if not slot.get("content_msgs"):
         return False
     client = client or app
     msg_id = slot["content_msgs"][0]
-
     async with _topic_resolve_lock:
-        src_id, top_id, top_title = await resolve_forward_topic(client, msg_id)
-        if not _is_valid_topic_title(top_title) or top_id is None:
-            log("TOPIC", f"{source}: chưa có topic hợp lệ cho msg={msg_id}")
-            return False
-
-        cur_title = slot.get("topic_title")
-        cur_src   = slot.get("topic_src_id")
-        if cur_title == top_title and cur_src == src_id:
+        if _is_valid_topic_title(slot.get("topic_title")):
             return True
-
-        if cur_title and cur_title != top_title:
-            log("TOPIC", f"{source}: sửa topic {cur_title!r} → {top_title!r} (src={src_id})")
-
-        _set_slot_topic(slot, src_id, top_id, top_title, source=source)
-        ev = slot.get("_topic_event")
-        if ev is not None and not ev.is_set():
-            ev.set()
-        return True
+        src_id, top_id, top_title = await resolve_forward_topic(client, msg_id)
+        if top_id is not None and _is_valid_topic_title(top_title):
+            _set_slot_topic(slot, src_id, top_id, top_title, source="fallback")
+            return True
+    return False
 
 
 TOPIC_MAP_TXT = "topic_map.txt"
@@ -818,10 +808,10 @@ def schedule_update_menu(n):
 
 
 async def update_menu(slot, n, gen=None):
-    await asyncio.sleep(2)
+    await asyncio.sleep(MENU_DEBOUNCE_SEC)
     if gen is not None and gen != slot.get("_menu_gen"):
         return
-    if not slot.get("waiting"):
+    if not slot.get("waiting") or slot.get("_batch_processing"):
         return
 
     for _ in range(30):
@@ -829,9 +819,8 @@ async def update_menu(slot, n, gen=None):
             break
         await asyncio.sleep(0.5)
 
-    if len(slot["content_msgs"]) != n or not slot["waiting"]:
+    if len(slot["content_msgs"]) != n or not slot.get("waiting"):
         return
-
     if gen is not None and gen != slot.get("_menu_gen"):
         return
 
@@ -840,60 +829,97 @@ async def update_menu(slot, n, gen=None):
         await do_all_forward(slot)
         return
 
-    # Xác nhận topic từ bài đầu batch trước khi auto-map
-    topic_ok = await ensure_topic_detected(slot, app)
-    if not topic_ok:
-        log("TOPIC", "Chưa xác nhận được topic — chờ thêm hoặc chọn tay /done")
-        text = get_menu(n)
-        if slot.get("menu_msg_id"):
-            ok = await robust_edit(INTERMEDIATE_CHAT, slot["menu_msg_id"], text)
-            if ok:
-                return
-            slot["menu_msg_id"] = None
-        m = await robust_send(text)
-        if m is not None:
-            slot["menu_msg_id"] = m.id
-        return
+    mode      = get_xepbai_mode()
+    media_cnt = slot.get("total_media_count", 0)
+    media_hint = f"{n} bài / {media_cnt} media" if media_cnt else f"{n} bài"
 
-    if len(slot["content_msgs"]) != n or not slot.get("waiting"):
-        return
+    # xepbai=off → luôn auto xếp (không cần chờ topic để báo user)
+    if mode == "off":
+        mapped_cmds  = find_cmds_for_topic_title(slot.get("topic_title"))
+        whitelist    = get_xepbai_whitelist()
+        force_manual = any(c.lower() in whitelist for c in mapped_cmds)
+        if not force_manual:
+            await safe_send(f"⏳ {media_hint} — chạy nền...")
+            slot["_batch_processing"] = True
+            asyncio.ensure_future(_auto_process_batch(slot, n, gen))
+            return
 
-    mode         = get_xepbai_mode()
+    # xepbai=on nhưng đã có topic + map → báo ngay, xử lý nền
     mapped_cmds  = find_cmds_for_topic_title(slot.get("topic_title"))
     whitelist    = get_xepbai_whitelist()
     force_manual = any(c.lower() in whitelist for c in mapped_cmds)
     topic_auto   = bool(mapped_cmds) and not force_manual
-    log("XEPBAI", f"mode={mode} topic={slot.get('topic_title')!r} src={slot.get('topic_src_id')} "
-                  f"mapped={mapped_cmds} force_manual={force_manual} topic_auto={topic_auto}")
-
-    if (mode == "off" and not force_manual) or topic_auto:
-        if not slot["ads_msgs"]:
-            await load_ads()
-        ads_count = max(1, len(slot["ads_msgs"]))
-        best      = max(1, round(n / ads_count))
-        reason    = f"topic map ({slot.get('topic_title')!r})" if topic_auto else "xepbai=off"
-        log("XEPBAI", f"{reason} → tự xếp /done{best}")
-        media_cnt = slot.get("total_media_count", 0)
-        media_hint = f"{n} bài / {media_cnt} media" if media_cnt else f"{n} bài"
-        asyncio.ensure_future(safe_send(f"⏳ {media_hint} — đang xếp & forward..."))
-        await build_sequence(best)
+    if topic_auto:
+        await safe_send(f"⏳ {media_hint} — chạy nền...")
+        slot["_batch_processing"] = True
+        asyncio.ensure_future(_auto_process_batch(slot, n, gen))
         return
 
+    # xepbai=on: topic đang detect hoặc đã có → báo nền, chờ map trong background
+    if slot.get("_topic_detect_started") and not force_manual:
+        await safe_send(f"⏳ {media_hint} — chạy nền...")
+        slot["_batch_processing"] = True
+        asyncio.ensure_future(_auto_process_batch(slot, n, gen))
+        return
+
+    # Manual: hiện menu /done
     text = get_menu(n)
     if slot.get("menu_msg_id"):
         ok = await robust_edit(INTERMEDIATE_CHAT, slot["menu_msg_id"], text)
         if ok:
             return
         slot["menu_msg_id"] = None
-
-    if len(slot["content_msgs"]) != n or not slot["waiting"]:
+    if len(slot["content_msgs"]) != n or not slot.get("waiting"):
         return
-
     m = await robust_send(text)
     if m is not None:
         slot["menu_msg_id"] = m.id
     else:
         log("ERROR", f"update_menu: không gửi được menu n={n}")
+
+
+async def _auto_process_batch(slot, n, gen):
+    """Xếp + forward nền. Topic đã detect từ bài đầu — chờ tối đa, không block user."""
+    try:
+        if gen is not None and gen != slot.get("_menu_gen"):
+            return
+        if not slot.get("waiting"):
+            return
+
+        mode = get_xepbai_mode()
+        await wait_for_topic(slot)
+        if not _is_valid_topic_title(slot.get("topic_title")):
+            await _topic_fallback_once(slot, app)
+
+        if gen is not None and gen != slot.get("_menu_gen"):
+            return
+        if not slot.get("waiting"):
+            return
+
+        mapped_cmds  = find_cmds_for_topic_title(slot.get("topic_title"))
+        whitelist    = get_xepbai_whitelist()
+        force_manual = any(c.lower() in whitelist for c in mapped_cmds)
+        topic_auto   = bool(mapped_cmds) and not force_manual
+        auto         = (mode == "off" and not force_manual) or topic_auto
+
+        if not auto:
+            text = get_menu(n)
+            await safe_send(text)
+            return
+
+        if not slot["ads_msgs"]:
+            await load_ads()
+        ads_count = max(1, len(slot["ads_msgs"]))
+        best      = max(1, round(n / ads_count))
+        reason    = f"topic={slot.get('topic_title')!r}" if topic_auto else "xepbai=off"
+        log("XEPBAI", f"nền {reason} → /done{best} mapped={mapped_cmds}")
+        await build_sequence(best, slot=slot)
+
+    except Exception as e:
+        log("ERROR", f"_auto_process_batch: {type(e).__name__}: {e}\n{traceback.format_exc()}")
+        await safe_send(f"❌ Lỗi xếp batch: {type(e).__name__}")
+    finally:
+        slot["_batch_processing"] = False
 
 
 async def raw_forward(from_peer, to_peer, ids: list):
@@ -1120,8 +1146,8 @@ async def forward_sequence_to_channel(target_id, sequence):
     return sent_count, failed_items, dead_reason
 
 
-async def build_sequence(content_per_ads=1, mode="normal"):
-    slot         = active_slot()
+async def build_sequence(content_per_ads=1, mode="normal", slot=None):
+    slot         = slot or active_slot()
     contents     = slot["content_msgs"]
     n            = len(contents)
     ads_chat     = slot["ads_chat_id"] or ADS_CHAT
@@ -1130,6 +1156,11 @@ async def build_sequence(content_per_ads=1, mode="normal"):
     media_str    = f"{n} bài / {media_cnt} media" if media_cnt else f"{n} bài"
 
     log("BUILD", f"mode={mode} n={n} media={media_cnt} ads={len(slot['ads_msgs'])} cpa={content_per_ads}")
+
+    if slot.get("_topic_detect_started") and not _is_valid_topic_title(slot.get("topic_title")):
+        await wait_for_topic(slot, max_wait=10)
+        if not _is_valid_topic_title(slot.get("topic_title")):
+            await _topic_fallback_once(slot, app)
 
     if not slot["ads_msgs"]:
         log("BUILD", "Không có ads — forward content không xen ads")
@@ -1212,17 +1243,7 @@ async def build_sequence(content_per_ads=1, mode="normal"):
     slot["awaiting_channel"] = True
     slot["waiting"]          = False
 
-    if not await verify_slot_topic(slot, app, source="build_sequence"):
-        await safe_send(
-            f"⚠️ Chưa xác nhận được topic (có thể đang flood) — batch {media_str}.\n"
-            f"Chờ vài giây rồi gõ /done hoặc chọn kênh tay."
-        )
-        slot["awaiting_channel"] = True
-        channels            = load_channels()
-        chan_lines, cmd_map = build_channel_commands(channels)
-        slot["channel_commands"] = cmd_map
-        return
-
+    # Topic đã detect từ bài đầu (_detect) — không gọi API lại
     mapped_cmds = find_cmds_for_topic_title(slot.get("topic_title"))
 
     if len(mapped_cmds) >= 2:
@@ -2066,7 +2087,7 @@ async def handler(client, msg: Message):
 
     if text == "/help":
         await safe_send(
-            "📖 Hướng dẫn v23\n"
+            "📖 Hướng dẫn v24\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
             "🚀 Flow:\n"
             "  1. Forward bài vào Saved Messages\n"
@@ -2148,7 +2169,7 @@ async def main():
     n_folders  = len(load_folders())
     n_channels = len(load_channels())
     await safe_send(
-        "🤖 Userbot v23 đã khởi động!\n"
+        "🤖 Userbot v24 đã khởi động!\n"
         f"📡 {n_channels} kênh • 📁 {n_folders} folder auto-sync\n"
         "➡️ Forward bài vào Saved Messages → /done* → nhập tên kênh.\n"
         "Gõ /help để xem hướng dẫn."
